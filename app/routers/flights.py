@@ -1,154 +1,142 @@
-from fastapi import APIRouter, HTTPException
-from app.core.database import db
-from app.models.schemas import FlightSearch, FlightResponse
-from typing import List
-from datetime import datetime, timedelta
+# -*- coding: utf-8 -*-
+from fastapi import APIRouter, HTTPException, status, Query
+from app.database.models import Flight, Route, Aircraft
+from typing import List, Optional
+from datetime import datetime
 
 router = APIRouter()
 
-@router.get("/search", response_model=List[FlightResponse])
+
+@router.get("/search")
 async def search_flights(
-    from_city: str,
-    to_city: str,
-    departure_date: str,
-    passengers: int = 1,
-    seat_class: str = None,
-    trip_type: str = "oneWay"
+    departure_city: str = Query(..., description="出发城市"),
+    arrival_city: str = Query(..., description="到达城市"),
+    departure_date: str = Query(..., description="出发日期 (YYYY-MM-DD)")
 ):
     """搜索航班"""
     try:
-        # 解析日期
-        search_date = datetime.strptime(departure_date, "%Y-%m-%d").date()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="日期格式错误，请使用 YYYY-MM-DD 格式")
-    
-    # 构建查询条件
-    query = """
-        SELECT f.*, r.departure_city, r.arrival_city, a.airline_name
-        FROM flights f
-        JOIN routes r ON f.route_id = r.route_id
-        JOIN airlines a ON f.airline_id = a.airline_id
-        WHERE r.departure_city = %s 
-        AND r.arrival_city = %s
-        AND DATE(f.departure_time) = %s
-        AND f.status = '计划中'
-    """
-    params = [from_city, to_city, search_date]
-    
-    # 如果指定了舱位类型，添加舱位可用性检查
-    if seat_class:
-        if seat_class == "经济舱":
-            query += " AND f.economy_seats_available >= %s"
-            params.append(passengers)
-        elif seat_class == "商务舱":
-            query += " AND f.business_seats_available >= %s"
-            params.append(passengers)
-        elif seat_class == "头等舱":
-            query += " AND f.first_class_seats_available >= %s"
-            params.append(passengers)
-    
-    query += " ORDER BY f.departure_time"
-    
-    flights = db.execute_query(query, tuple(params))
-    
-    # 转换为前端期望的格式
-    formatted_flights = []
-    for flight in flights:
-        # 计算飞行时长
-        departure_time = flight["departure_time"]
-        arrival_time = flight["arrival_time"]
-        duration = arrival_time - departure_time
-        duration_str = f"{duration.seconds // 3600}h {(duration.seconds % 3600) // 60}m"
+        # 验证日期格式
+        try:
+            datetime.strptime(departure_date, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="日期格式错误，请使用 YYYY-MM-DD 格式"
+            )
         
-        # 确定价格和可用座位数
-        if seat_class == "经济舱" or not seat_class:
-            price = flight["economy_price"]
-            seats_available = flight["economy_seats_available"]
-            class_type = "Economy"
-        elif seat_class == "商务舱":
-            price = flight["business_price"]
-            seats_available = flight["business_seats_available"]
-            class_type = "Business"
-        elif seat_class == "头等舱":
-            price = flight["first_class_price"]
-            seats_available = flight["first_class_seats_available"]
-            class_type = "First"
+        flights = Flight.search_flights(departure_city, arrival_city, departure_date)
         
-        formatted_flight = {
-            "id": flight["flight_id"],
-            "airline": flight["airline_name"],
-            "flight_number": flight["flight_number"],
-            "departure": {
-                "city": flight["departure_city"],
-                "time": departure_time.strftime("%H:%M"),
-                "airport": f"{flight['departure_city']}机场"
-            },
-            "arrival": {
-                "city": flight["arrival_city"],
-                "time": arrival_time.strftime("%H:%M"),
-                "airport": f"{flight['arrival_city']}机场"
-            },
-            "duration": duration_str,
-            "price": price,
-            "class_type": class_type,
-            "seats_available": seats_available,
-            "status": flight["status"]
+        # 构建响应数据
+        flight_list = []
+        for flight in flights:
+            route = flight.get_route()
+            aircraft = flight.get_aircraft()
+            
+            flight_data = {
+                "flight_id": flight.flight_id,
+                "flight_number": flight.flight_number,
+                "airline": flight.airline,
+                "departure_city": route.departure_city if route else None,
+                "arrival_city": route.arrival_city if route else None,
+                "departure_time": flight.departure_time,
+                "arrival_time": flight.arrival_time,
+                "business_price": flight.business_price,
+                "economy_price": flight.economy_price,
+                "first_class_price": flight.first_class_price,
+                "business_seats_available": flight.business_seats_available,
+                "economy_seats_available": flight.economy_seats_available,
+                "first_class_seats_available": flight.first_class_seats_available,
+                "status": flight.status,
+                "aircraft_model": aircraft.model_name if aircraft else None
+            }
+            flight_list.append(flight_data)
+        
+        return {
+            "flights": flight_list,
+            "total": len(flight_list)
         }
-        formatted_flights.append(formatted_flight)
-    
-    return formatted_flights
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"搜索航班失败: {str(e)}"
+        )
 
-@router.get("/{flight_id}", response_model=FlightResponse)
-async def get_flight_detail(flight_id: int):
+
+@router.get("/{flight_id}")
+async def get_flight(flight_id: int):
     """获取航班详情"""
-    flight = db.execute_one(
-        """SELECT f.*, r.departure_city, r.arrival_city, a.airline_name
-           FROM flights f
-           JOIN routes r ON f.route_id = r.route_id
-           JOIN airlines a ON f.airline_id = a.airline_id
-           WHERE f.flight_id = %s""",
-        (flight_id,)
-    )
-    
-    if not flight:
-        raise HTTPException(status_code=404, detail="航班不存在")
-    
-    # 计算飞行时长
-    departure_time = flight["departure_time"]
-    arrival_time = flight["arrival_time"]
-    duration = arrival_time - departure_time
-    duration_str = f"{duration.seconds // 3600}h {(duration.seconds % 3600) // 60}m"
-    
-    return {
-        "id": flight["flight_id"],
-        "airline": flight["airline_name"],
-        "flight_number": flight["flight_number"],
-        "departure": {
-            "city": flight["departure_city"],
-            "time": departure_time.strftime("%H:%M"),
-            "airport": f"{flight['departure_city']}机场"
-        },
-        "arrival": {
-            "city": flight["arrival_city"],
-            "time": arrival_time.strftime("%H:%M"),
-            "airport": f"{flight['arrival_city']}机场"
-        },
-        "duration": duration_str,
-        "price": flight["economy_price"],
-        "class_type": "Economy",
-        "seats_available": flight["economy_seats_available"],
-        "status": flight["status"]
-    }
+    try:
+        flight = Flight.get_by_id(flight_id)
+        if not flight:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="航班不存在"
+            )
+        
+        route = flight.get_route()
+        aircraft = flight.get_aircraft()
+        
+        flight_data = {
+            "flight_id": flight.flight_id,
+            "flight_number": flight.flight_number,
+            "airline": flight.airline,
+            "departure_city": route.departure_city if route else None,
+            "arrival_city": route.arrival_city if route else None,
+            "departure_time": flight.departure_time,
+            "arrival_time": flight.arrival_time,
+            "business_price": flight.business_price,
+            "economy_price": flight.economy_price,
+            "first_class_price": flight.first_class_price,
+            "business_seats_available": flight.business_seats_available,
+            "economy_seats_available": flight.economy_seats_available,
+            "first_class_seats_available": flight.first_class_seats_available,
+            "status": flight.status,
+            "aircraft_model": aircraft.model_name if aircraft else None,
+            "distance_km": route.distance_km if route else None
+        }
+        
+        return flight_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取航班详情失败: {str(e)}"
+        )
+
 
 @router.get("/")
-async def get_all_flights():
-    """获取所有航班（用于管理）"""
-    flights = db.execute_query(
-        """SELECT f.*, r.departure_city, r.arrival_city, a.airline_name
-           FROM flights f
-           JOIN routes r ON f.route_id = r.route_id
-           JOIN airlines a ON f.airline_id = a.airline_id
-           ORDER BY f.departure_time DESC
-           LIMIT 50"""
-    )
-    return flights 
+async def get_all_flights(
+    skip: int = Query(0, ge=0, description="跳过记录数"),
+    limit: int = Query(100, ge=1, le=1000, description="返回记录数")
+):
+    """获取所有航班"""
+    try:
+        # 这里可以添加分页查询逻辑
+        query = """
+            SELECT f.*, r.departure_city, r.arrival_city, a.model_name as aircraft_model
+            FROM flights f
+            LEFT JOIN routes r ON f.route_id = r.route_id
+            LEFT JOIN aircraft a ON f.aircraft_id = a.aircraft_id
+            ORDER BY f.departure_time DESC
+            LIMIT %s OFFSET %s
+        """
+        
+        from app.database.database import get_database
+        db = get_database()
+        data_list = db.execute_query(query, (limit, skip))
+        
+        return {
+            "flights": data_list,
+            "total": len(data_list)
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"获取航班列表失败: {str(e)}"
+        ) 
